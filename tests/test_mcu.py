@@ -8,15 +8,71 @@ import unittest
 import sys
 sys.path.append("..")
 
+import os
+import struct
+import tempfile
+
+from keystone import Ks, KS_ARCH_ARM, KS_MODE_THUMB
+
 from qiling.core import Qiling
 from qiling.const import QL_ARCH, QL_OS, QL_VERBOSE
+from qiling.hw.const.stm32f4xx_adc import ADC_SR, ADC_CR2
 from qiling.extensions.mcu.stm32f4 import stm32f407, stm32f411, stm32f429
 from qiling.extensions.mcu.stm32f1 import stm32f103
 from qiling.extensions.mcu.atmel import sam3x8e
 from qiling.extensions.mcu.gd32vf1 import gd32vf103
 
 
+FLASH_BASE = 0x8000000
+SRAM_BASE  = 0x20000000
+
+def assemble_thumb(code: str, addr: int) -> bytes:
+    ks = Ks(KS_ARCH_ARM, KS_MODE_THUMB)
+    encoding, _ = ks.asm(code, addr=addr)
+
+    return bytes(encoding)
+
+def make_firmware(chunks, isr=None, irqn=0x12):
+    """ Assemble Thumb-2 code chunks into a Cortex-M firmware image,
+        complete with a vector table holding the reset handler and the
+        interrupt handler of `irqn`.
+    """
+
+    vec_size = (16 + irqn + 1) * 4
+
+    addr = FLASH_BASE + vec_size
+    image = b''
+    addrs = []
+
+    for chunk in chunks:
+        addrs.append(addr)
+        binary = assemble_thumb(chunk, addr)
+        image += binary
+        addr += len(binary)
+
+    if isr is None:
+        isr_entry = 0
+    else:
+        isr_entry = addr | 1
+        image += assemble_thumb(isr, addr)
+
+    vector = struct.pack('<II', SRAM_BASE + 0x20000, addrs[0] | 1)
+    vector += b'\x00' * (vec_size - 4 - len(vector))
+    vector += struct.pack('<I', isr_entry)
+
+    return vector + image, addrs
+
+
 class MCUTest(unittest.TestCase):
+    def make_firmware_file(self, image: bytes) -> str:
+        fd, path = tempfile.mkstemp(suffix='.bin')
+        self.addCleanup(os.remove, path)
+
+        with os.fdopen(fd, 'wb') as f:
+            f.write(image)
+
+        return path
+
     def test_mcu_led_stm32f411(self):
         ql = Qiling(["../examples/rootfs/mcu/stm32f411/rand_blink.hex"],
                     archtype=QL_ARCH.CORTEX_M, ostype=QL_OS.MCU, env=stm32f411, verbose=QL_VERBOSE.DISASM)
@@ -439,6 +495,164 @@ class MCUTest(unittest.TestCase):
 
         self.assertEqual(ql.hw.usart2.recv(), b'Nice Hack!\n')
         self.assertEqual(ql.hw.usart3.recv(), b'Welcome to the world of Hacking!\naaaaaaaaaaaaaaaaaaaa\xa9\x05\n')
+
+    def test_mcu_adc_poll_stm32f411(self):
+        # firmware: start a regular conversion, poll SR.EOC, read DR and
+        # store the result and the post-read SR into SRAM
+        main = '''
+            movw r0, #0x2000
+            movt r0, #0x4001
+            mov  r1, #1
+            str  r1, [r0, #8]
+            movw r1, #0x0001
+            movt r1, #0x4000
+            str  r1, [r0, #8]
+        poll:
+            ldr  r2, [r0]
+            tst  r2, #2
+            beq  poll
+            ldr  r3, [r0, #0x4c]
+            movw r4, #0x0000
+            movt r4, #0x2000
+            str  r3, [r4]
+            ldr  r2, [r0]
+            str  r2, [r4, #4]
+        done:
+            b    done
+        '''
+
+        image, _ = make_firmware([main])
+        path = self.make_firmware_file(image)
+
+        ql = Qiling([path, FLASH_BASE],
+                    archtype=QL_ARCH.CORTEX_M, ostype=QL_OS.MCU, env=stm32f411, verbose=QL_VERBOSE.OFF)
+
+        ql.hw.create('adc1')
+        ql.hw.adc1.data = 0xabc
+
+        ql.run(count=100)
+
+        # converted value reached the firmware
+        self.assertEqual(ql.mem.read_ptr(SRAM_BASE), 0xabc)
+        # EOC was cleared by reading DR
+        self.assertEqual(ql.mem.read_ptr(SRAM_BASE + 4) & ADC_SR.EOC, 0)
+        # SWSTART is self-clearing
+        self.assertEqual(ql.hw.adc1.instance.CR2 & ADC_CR2.SWSTART, 0)
+
+        del ql
+
+    def test_mcu_adc_interrupt_stm32f411(self):
+        # firmware: enable the ADC interrupt in the NVIC, start a conversion
+        # with EOCIE set and wait for the ISR to deliver the result
+        main = '''
+            movw r0, #0xe100
+            movt r0, #0xe000
+            movw r1, #0x0000
+            movt r1, #0x0004
+            str  r1, [r0]
+            movw r0, #0x2000
+            movt r0, #0x4001
+            mov  r1, #32
+            str  r1, [r0, #4]
+            movw r1, #0x0001
+            movt r1, #0x4000
+            str  r1, [r0, #8]
+            movw r4, #0x0000
+            movt r4, #0x2000
+        wait:
+            ldr  r5, [r4, #4]
+            cmp  r5, #0
+            beq  wait
+        done:
+            b    done
+        '''
+
+        isr = '''
+            movw r0, #0x2000
+            movt r0, #0x4001
+            ldr  r1, [r0, #0x4c]
+            movw r2, #0x0000
+            movt r2, #0x2000
+            str  r1, [r2]
+            mov  r3, #1
+            str  r3, [r2, #4]
+            bx   lr
+        '''
+
+        image, _ = make_firmware([main], isr=isr)
+        path = self.make_firmware_file(image)
+
+        ql = Qiling([path, FLASH_BASE],
+                    archtype=QL_ARCH.CORTEX_M, ostype=QL_OS.MCU, env=stm32f411, verbose=QL_VERBOSE.OFF)
+
+        ql.hw.create('adc1')
+        ql.hw.adc1.data = 0xdef
+
+        ql.run(count=200)
+
+        # the ISR ran and handed the converted value to the firmware
+        self.assertEqual(ql.mem.read_ptr(SRAM_BASE), 0xdef)
+        self.assertEqual(ql.mem.read_ptr(SRAM_BASE + 4), 1)
+
+        del ql
+
+    def test_mcu_adc_snapshot_stm32f411(self):
+        # firmware part1 starts a conversion, part2 polls and stores the
+        # result; snapshot the peripheral between the two stages
+        part1 = '''
+            movw r0, #0x2000
+            movt r0, #0x4001
+            movw r1, #0x0001
+            movt r1, #0x4000
+            str  r1, [r0, #8]
+        '''
+
+        part2 = '''
+        poll:
+            ldr  r2, [r0]
+            tst  r2, #2
+            beq  poll
+            ldr  r3, [r0, #0x4c]
+            movw r4, #0x0000
+            movt r4, #0x2000
+            str  r3, [r4]
+        done:
+            b    done
+        '''
+
+        image, addrs = make_firmware([part1, part2])
+        path = self.make_firmware_file(image)
+
+        def create_qiling():
+            ql = Qiling([path, FLASH_BASE],
+                        archtype=QL_ARCH.CORTEX_M, ostype=QL_OS.MCU, env=stm32f411, verbose=QL_VERBOSE.OFF)
+
+            ql.hw.create('adc1')
+            ql.hw.adc1.data = 0x5aa
+
+            return ql
+
+        ql1 = create_qiling()
+        ql1.run(end=addrs[1] | 1)  # Cortex-M end addresses carry the Thumb bit
+
+        # conversion completed, EOC is part of the snapshot
+        self.assertTrue(ql1.hw.adc1.instance.SR & ADC_SR.EOC)
+
+        snapshot = ql1.save(hw=True)
+
+        ql2 = create_qiling()
+        ql2.restore(snapshot)
+
+        self.assertTrue(ql2.hw.adc1.instance.SR & ADC_SR.EOC)
+
+        reads = []
+        ql2.hw.adc1.hook_read(lambda periph, access, offset, size, value: reads.append(offset))
+        ql2.run(count=100)
+
+        self.assertEqual(ql2.mem.read_ptr(SRAM_BASE), 0x5aa)
+        self.assertIn(ql2.hw.adc1.struct.DR.offset, reads)
+
+        del ql1, ql2
 
 
 if __name__ == "__main__":

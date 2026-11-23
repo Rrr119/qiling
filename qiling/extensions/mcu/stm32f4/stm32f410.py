@@ -220,6 +220,9 @@ stm32f410 = {
     "ADC1": {
         "base": 0x40012000,
         "struct": "STM32F4xxAdc",
+        "kwargs": {
+            "intn": 0x12
+        },
         "type": "peripheral"
     },
     "SPI1": {

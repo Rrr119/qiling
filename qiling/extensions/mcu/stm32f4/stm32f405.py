@@ -334,16 +334,25 @@ stm32f405 = {
     "ADC1": {
         "base": 0x40012000,
         "struct": "STM32F4xxAdc",
+        "kwargs": {
+            "intn": 0x12
+        },
         "type": "peripheral"
     },
     "ADC2": {
         "base": 0x40012100,
         "struct": "STM32F4xxAdc",
+        "kwargs": {
+            "intn": 0x12
+        },
         "type": "peripheral"
     },
     "ADC3": {
         "base": 0x40012200,
         "struct": "STM32F4xxAdc",
+        "kwargs": {
+            "intn": 0x12
+        },
         "type": "peripheral"
     },
     "SDIO": {

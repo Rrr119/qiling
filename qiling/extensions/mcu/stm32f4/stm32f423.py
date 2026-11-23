@@ -394,6 +394,9 @@ stm32f423 = {
     "ADC1": {
         "base": 0x40012000,
         "struct": "STM32F4xxAdc",
+        "kwargs": {
+            "intn": 0x12
+        },
         "type": "peripheral"
     },
     "SDIO": {

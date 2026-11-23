@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid34548",
+  "B": "/home/dev/feedback/uid34548",
+  "sha": "468fea5eb97e03cd2a068d3b95d4732ed99c73b9",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "qilingframework",
+    "repo": "qiling",
+    "sha": "468fea5eb97e03cd2a068d3b95d4732ed99c73b9"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "qiling",
+    "cloneUrl": "https://github.com/Rrr119/qiling.git"
+  },
+  "at": "2026-11-23T01:26:41.729Z"
+}
